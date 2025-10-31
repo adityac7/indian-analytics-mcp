@@ -1,0 +1,18 @@
+services:
+  - type: web
+    name: indian-analytics-mcp
+    runtime: python
+    plan: free
+    buildCommand: pip install -r requirements.txt
+    startCommand: python server.py
+    envVars:
+      - key: PORT
+        value: 10000
+      - key: DATASET_1_NAME
+        value: digital_insights
+      - key: DATASET_1_DESC
+        value: Mobile app usage data including app opens, duration, demographics, and weighted user representation
+      - key: DATASET_1_CONNECTION
+        value: postgresql://analytics_db_clug_user:sa1jEkjEmuIKRxQu3x6Oa83Ep4AWGSAM@dpg-d3pmmtali9vc73bn81i0-a.singapore-postgres.render.com/analytics_db_clug
+      - key: DATASET_1_DICTIONARY
+        value: '{"digital_insights": "Mobile app usage events with demographics and weights", "datasets": "Dataset metadata", "metadata": "Column descriptions", "query_logs": "Query execution logs"}'
