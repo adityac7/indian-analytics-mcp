@@ -9,7 +9,7 @@ import uuid
 import asyncio
 from typing import Dict, Any, Optional, List
 from fastapi import FastAPI, Request, Response, Header
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, StreamingResponse
 from fastapi.middleware.cors import CORSMiddleware
 import asyncpg
 
@@ -473,9 +473,42 @@ async def mcp_post(
 
 
 @app.get("/mcp")
-async def mcp_get():
-    """Handle MCP GET requests (SSE streams not supported)."""
-    return Response(status_code=405, content="Server-initiated streams not supported")
+async def mcp_get(
+    request: Request,
+    mcp_session_id: Optional[str] = Header(None, alias="Mcp-Session-Id"),
+    mcp_protocol_version: Optional[str] = Header(None, alias="MCP-Protocol-Version")
+):
+    """Handle MCP GET requests to open SSE stream."""
+    # Validate protocol version
+    if mcp_protocol_version and mcp_protocol_version != MCP_PROTOCOL_VERSION:
+        return Response(status_code=400, content="Unsupported protocol version")
+    
+    # Validate session if provided
+    if mcp_session_id and mcp_session_id not in sessions:
+        return Response(status_code=404, content="Session not found")
+    
+    # Return SSE stream that stays open
+    async def event_stream():
+        # Keep connection alive with periodic comments
+        # This allows server to send notifications/requests if needed
+        try:
+            while True:
+                # Send keepalive comment every 30 seconds
+                yield ": keepalive\\n\\n"
+                await asyncio.sleep(30)
+        except asyncio.CancelledError:
+            # Client disconnected
+            pass
+    
+    return StreamingResponse(
+        event_stream(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no"
+        }
+    )
 
 
 # REST API for backward compatibility
