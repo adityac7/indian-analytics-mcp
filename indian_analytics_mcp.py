@@ -1,26 +1,22 @@
 #!/usr/bin/env python3
 """
-Indian Consumer Analytics MCP Server
+Indian Consumer Analytics MCP Server - Enhanced Version
 
-Provides access to representative Indian consumer behavior data including:
-- Mobile app usage (installs, duration, timestamps)
-- E-commerce funnel activity (search, ads, cart, purchases)
-- Social media ad exposure (Instagram, Facebook, YouTube, X, Truecaller, Snapchat)
-- OTT content consumption (audio/video with exact content & duration)
-- CTV usage patterns
-- Demographics (age, gender, NCCS, townclass, state)
+Marketing-Focused Design:
+- Natural language queries
+- Pre-built analytics for common use cases
+- Business-friendly tool names and descriptions
+- Rich contextual help with examples
+- Automatic insights generation
 
-All queries automatically apply:
-- Weighting (users represent N others in their demographic cell)
-- NCCS merging (A/A1→A, B→B, C/D/E→C/D/E)
-
-Data: 100K active mobile users, ~500K total, ~1K CTV users
-Update frequency: Monthly
+For technical users: All original SQL capabilities preserved
+For marketers: Intuitive tools that answer business questions directly
 """
 
 import os
 import json
 import asyncio
+import re
 from typing import Optional, List, Dict, Any, Literal
 from enum import Enum
 from contextlib import asynccontextmanager
@@ -31,45 +27,70 @@ from mcp.server.fastmcp import FastMCP, Context
 
 # Constants
 CHARACTER_LIMIT = 25000
-RAW_DATA_LIMIT = 5  # Max rows for non-aggregated queries
-AGGREGATED_LIMIT = 1000  # Max rows for GROUP BY queries
+RAW_DATA_LIMIT = 5
+AGGREGATED_LIMIT = 1000
 
-# NCCS Mapping: A/A1→A, B→B, C/D/E→C/D/E
+# NCCS Mapping
 NCCS_MERGE_MAP = {
-    'A': 'A',
-    'A1': 'A',
+    'A': 'A', 'A1': 'A',
     'B': 'B',
-    'C': 'C/D/E',
-    'D': 'C/D/E',
-    'E': 'C/D/E'
+    'C': 'C/D/E', 'D': 'C/D/E', 'E': 'C/D/E'
+}
+
+# Business glossary
+GLOSSARY = {
+    "nccs": {
+        "name": "Socioeconomic Class (NCCS)",
+        "description": "New Consumer Classification System - India's standard for income/lifestyle segmentation",
+        "values": {
+            "A": "High income, affluent (top 10%)",
+            "B": "Upper middle class (next 20%)",
+            "C/D/E": "Middle to lower income (remaining 70%)"
+        },
+        "marketing_use": "Target premium products to NCCS A, mass market to C/D/E",
+        "note": "Classes automatically merged for statistical reliability: A1→A, C/D/E combined"
+    },
+    "weights": {
+        "name": "Population Weighting",
+        "description": "Each user represents multiple people in their demographic segment",
+        "example": "weight=4 means this user represents 4,000 similar users",
+        "why": "Survey sample (634 users) weighted to represent 5.3M smartphone users",
+        "usage": "Always use SUM(weights) for user counts, never COUNT(*)"
+    },
+    "age_bucket": {
+        "name": "Age Groups",
+        "values": ["18-24", "25-34", "35-44", "45-54", "55+"],
+        "marketing_use": "Segment campaigns by generation/life stage"
+    },
+    "townclass": {
+        "name": "Urban Classification",
+        "values": {
+            "Metro": "Mumbai, Delhi, Bangalore, etc.",
+            "Tier 1": "Large cities",
+            "Tier 2": "Medium cities",
+            "Tier 3+": "Smaller towns"
+        }
+    }
 }
 
 
 class ResponseFormat(str, Enum):
-    """Output format options."""
     MARKDOWN = "markdown"
     JSON = "json"
 
 
-# Dataset registry - populated from environment variables
+# Dataset registry
 DATASETS: Dict[int, Dict[str, Any]] = {}
 
 
 def load_datasets_from_env():
-    """Load dataset configurations from environment variables.
-    
-    Expected format:
-    DATASET_1_NAME=mobile_events
-    DATASET_1_DESC=Event-level mobile app usage data
-    DATASET_1_CONNECTION=postgresql://user:pass@host:port/db
-    DATASET_1_DICTIONARY={"table1": "desc1", "table2": "desc2"}
-    """
+    """Load dataset configurations from environment variables."""
     dataset_id = 1
     while True:
         name_key = f"DATASET_{dataset_id}_NAME"
         if name_key not in os.environ:
             break
-        
+
         DATASETS[dataset_id] = {
             "id": dataset_id,
             "name": os.environ[name_key],
@@ -84,8 +105,7 @@ def load_datasets_from_env():
 async def app_lifespan():
     """Manage database connection pools."""
     load_datasets_from_env()
-    
-    # Create connection pools for each dataset
+
     pools = {}
     for ds_id, ds_info in DATASETS.items():
         pools[ds_id] = await asyncpg.create_pool(
@@ -94,16 +114,14 @@ async def app_lifespan():
             max_size=10,
             command_timeout=60
         )
-    
+
     yield {"pools": pools}
-    
-    # Cleanup
+
     for pool in pools.values():
         await pool.close()
 
 
-# Initialize FastMCP server
-mcp = FastMCP("indian_analytics_mcp", lifespan=app_lifespan)
+mcp = FastMCP("indian_analytics_mcp_enhanced", lifespan=app_lifespan)
 
 
 # ============================================================================
@@ -114,106 +132,117 @@ async def get_pool(ctx: Context, dataset_id: int) -> asyncpg.Pool:
     """Get connection pool for a dataset."""
     pools = ctx.request_context.lifespan_state["pools"]
     if dataset_id not in pools:
-        raise ValueError(f"Dataset {dataset_id} not found. Use list_available_datasets to see available datasets.")
+        raise ValueError(f"Dataset {dataset_id} not found.")
     return pools[dataset_id]
 
 
 def apply_nccs_merge(query: str) -> str:
-    """Apply NCCS merging transformation to query.
-    
-    Replaces NCCS column references with CASE statements that merge:
-    - A, A1 → A
-    - B → B
-    - C, D, E → C/D/E
-    """
-    # Simple replacement - assumes column is named 'nccs' or 'NCCS'
-    # For production, could use SQL parsing for more robust handling
+    """Apply NCCS merging transformation."""
     merge_case = """
-    CASE 
+    CASE
         WHEN nccs IN ('A', 'A1') THEN 'A'
         WHEN nccs = 'B' THEN 'B'
         WHEN nccs IN ('C', 'D', 'E') THEN 'C/D/E'
         ELSE nccs
     END
     """.strip()
-    
-    # Replace in SELECT and GROUP BY clauses
-    # This is a simplified approach - works for most queries
-    if 'nccs' in query.lower():
-        # Check if already has CASE statement
-        if 'CASE' not in query and 'case' not in query:
-            # Replace column references (basic pattern matching)
-            import re
-            # In SELECT clause
-            query = re.sub(
-                r'\bnccs\b(?!\s*IN\s*\()',
-                f'({merge_case}) as nccs',
-                query,
-                flags=re.IGNORECASE,
-                count=1
-            )
-    
+
+    if 'nccs' in query.lower() and 'CASE' not in query and 'case' not in query:
+        query = re.sub(
+            r'\bnccs\b(?!\s*IN\s*\()',
+            f'({merge_case}) as nccs',
+            query,
+            flags=re.IGNORECASE,
+            count=1
+        )
+
     return query
 
 
 def has_group_by(query: str) -> bool:
-    """Check if query contains GROUP BY clause."""
+    """Check if query contains GROUP BY."""
     return 'group by' in query.lower()
 
 
 def format_markdown_table(rows: List[Dict], columns: List[str]) -> str:
-    """Format query results as markdown table."""
+    """Format results as markdown table."""
     if not rows:
         return "No results found."
-    
-    # Build header
+
     header = "| " + " | ".join(columns) + " |"
     separator = "| " + " | ".join(["---"] * len(columns)) + " |"
-    
-    # Build rows
+
     lines = [header, separator]
     for row in rows:
         values = [str(row.get(col, "")) for col in columns]
         lines.append("| " + " | ".join(values) + " |")
-    
+
     return "\n".join(lines)
 
 
-def truncate_response(response: str, metadata: str = "") -> str:
-    """Truncate response if it exceeds character limit."""
-    if len(response) <= CHARACTER_LIMIT:
-        return response
-    
-    # Calculate how much space for content
-    truncation_msg = f"\n\n⚠️ **Response truncated** (exceeded {CHARACTER_LIMIT:,} character limit). Use more specific filters or reduce limit parameter.\n{metadata}"
-    available_chars = CHARACTER_LIMIT - len(truncation_msg)
-    
-    truncated = response[:available_chars] + "..."
-    return truncated + truncation_msg
+def add_insights(results: List[Dict], query_type: str) -> str:
+    """Generate automatic insights from results."""
+    if not results:
+        return ""
+
+    insights = ["\n💡 **Key Insights:**"]
+
+    # Detect columns
+    columns = list(results[0].keys())
+
+    # Look for weighted counts
+    weight_cols = [c for c in columns if 'weight' in c.lower() or 'user' in c.lower() or 'count' in c.lower()]
+    if weight_cols and len(results) > 1:
+        weight_col = weight_cols[0]
+        total = sum(row.get(weight_col, 0) for row in results)
+        top_row = max(results, key=lambda r: r.get(weight_col, 0))
+
+        if total > 0:
+            top_pct = (top_row.get(weight_col, 0) / total) * 100
+            insights.append(f"- Top item accounts for {top_pct:.1f}% of total")
+
+            # Check concentration
+            if len(results) >= 3:
+                top_3_total = sum(row.get(weight_col, 0) for row in results[:3])
+                top_3_pct = (top_3_total / total) * 100
+                insights.append(f"- Top 3 items represent {top_3_pct:.1f}% of market")
+
+    # Look for demographic skews
+    if 'gender' in columns and len(results) == 2:
+        male = next((r for r in results if r.get('gender', '').lower() in ['male', 'm']), None)
+        female = next((r for r in results if r.get('gender', '').lower() in ['female', 'f']), None)
+
+        if male and female and weight_cols:
+            w_col = weight_cols[0]
+            male_val = male.get(w_col, 0)
+            female_val = female.get(w_col, 0)
+
+            if male_val > female_val * 1.2:
+                insights.append(f"- Skews male ({male_val/female_val:.1f}x more male users)")
+            elif female_val > male_val * 1.2:
+                insights.append(f"- Skews female ({female_val/male_val:.1f}x more female users)")
+            else:
+                insights.append("- Balanced gender distribution")
+
+    return "\n".join(insights) if len(insights) > 1 else ""
 
 
 # ============================================================================
-# CONTEXT LOADING TOOLS
+# ENHANCED BUSINESS TOOLS
 # ============================================================================
 
-class GetContextInput(BaseModel):
-    """Input for progressive context loading."""
+class GetGlossaryInput(BaseModel):
+    """Input for getting glossary."""
     model_config = ConfigDict(str_strip_whitespace=True, extra='forbid')
-    
-    level: int = Field(
-        default=0,
-        description="Context level: 0=global rules, 1=dataset list, 2=schema for dataset, 3=full details with samples",
-        ge=0,
-        le=3
-    )
-    dataset_id: Optional[int] = Field(
+
+    term: Optional[str] = Field(
         default=None,
-        description="Dataset ID (required for levels 2-3)"
+        description="Specific term to look up, or None for all terms"
     )
 
 
 @mcp.tool(
-    name="get_context",
+    name="explain_term",
     annotations={
         "readOnlyHint": True,
         "destructiveHint": False,
@@ -221,159 +250,463 @@ class GetContextInput(BaseModel):
         "openWorldHint": False
     }
 )
-async def get_context(params: GetContextInput, ctx: Context) -> str:
-    """Get progressive context about the MCP server and datasets.
-    
-    Context Levels:
-    - Level 0: Global rules (weighting, NCCS merging, output rules)
-    - Level 1: List of all active datasets
-    - Level 2: Detailed schema for specific dataset (requires dataset_id)
-    - Level 3: Full details with samples (requires dataset_id)
-    
+async def explain_term(params: GetGlossaryInput) -> str:
+    """Understand analytics terminology and data concepts.
+
+    📚 Use this when you see unfamiliar terms like:
+    - NCCS (What are these income classes?)
+    - weights (Why SUM(weights) instead of COUNT?)
+    - age_bucket (What age ranges are available?)
+    - townclass (Metro vs Tier 1 vs Tier 2?)
+
+    💡 Marketing Context:
+    Each term explanation includes:
+    - What it means in plain English
+    - Why it matters for marketing
+    - How to use it in queries
+    - Example applications
+
     Args:
-        params (GetContextInput): Context request parameters
-            - level (int): Context level 0-3
-            - dataset_id (Optional[int]): Required for levels 2-3
-    
+        term: Specific term to explain (e.g., "nccs", "weights")
+              Leave empty to see all available terms
+
     Returns:
-        str: Markdown formatted context
+        Detailed explanation with marketing context and usage examples
     """
-    if params.level in [2, 3] and params.dataset_id is None:
-        return "❌ Error: dataset_id required for levels 2-3"
-    
-    # Level 0: Global rules
-    if params.level == 0:
-        return """# Indian Consumer Analytics MCP - Global Rules
+    if params.term:
+        term_lower = params.term.lower()
+        if term_lower in GLOSSARY:
+            entry = GLOSSARY[term_lower]
+            lines = [f"# {entry['name']}\n"]
+            lines.append(f"**Definition:** {entry['description']}\n")
 
-## Data Overview
-- **Population**: Representative sample of Indian smartphone users
-- **Active users**: 100K mobile, ~1K CTV
-- **Total users**: ~500K
-- **Update frequency**: Monthly
-- **Data format**: Event-based with timestamps
-
-## Automatic Transformations
-
-### 1. Weighting (CRITICAL)
-- Every user has a `weights` column
-- `weights=4` means user represents 4,000 users in their demographic cell
-- **Always use SUM(weights) for user counts**
-- **Never extrapolate events** - only extrapolate users
-- Cell definition: age_group × gender × NCCS × townclass × state (~850 cells)
-
-### 2. NCCS Merging (Automatic)
-Socioeconomic classification merged as:
-- A, A1 → A
-- B → B  
-- C, D, E → C/D/E
-
-## Query Rules
-- **Raw data queries** (no GROUP BY): Limited to 5 rows (for inspection only)
-- **Aggregated queries** (with GROUP BY): Up to 1,000 rows
-- **Always include**: WHERE clauses to filter by time periods, states, or demographics
-- **Performance**: Use indexes on timestamp, state_grp, nccs, gender, age_bucket
-
-## Response Format
-- Results returned as markdown tables by default
-- JSON format available via `response_format` parameter
-"""
-    
-    # Level 1: Dataset list
-    if params.level == 1:
-        if not DATASETS:
-            return "❌ No datasets configured. Check environment variables."
-        
-        lines = ["# Available Datasets\n"]
-        for ds_id, ds_info in DATASETS.items():
-            lines.append(f"## Dataset {ds_id}: {ds_info['name']}")
-            lines.append(f"{ds_info['description']}\n")
-            if ds_info['dictionary']:
-                lines.append("**Tables:**")
-                for table, desc in ds_info['dictionary'].items():
-                    lines.append(f"- `{table}`: {desc}")
+            if 'values' in entry:
+                lines.append("**Possible Values:**")
+                if isinstance(entry['values'], dict):
+                    for key, desc in entry['values'].items():
+                        lines.append(f"- `{key}`: {desc}")
+                else:
+                    for val in entry['values']:
+                        lines.append(f"- `{val}`")
                 lines.append("")
-        
-        return "\n".join(lines)
-    
-    # Level 2: Schema
-    if params.level == 2:
-        pool = await get_pool(ctx, params.dataset_id)
-        
+
+            if 'marketing_use' in entry:
+                lines.append(f"**Marketing Application:** {entry['marketing_use']}\n")
+
+            if 'example' in entry:
+                lines.append(f"**Example:** {entry['example']}\n")
+
+            if 'note' in entry:
+                lines.append(f"**Note:** {entry['note']}\n")
+
+            return "\n".join(lines)
+        else:
+            available = ", ".join([f"`{t}`" for t in GLOSSARY.keys()])
+            return f"❌ Term '{params.term}' not found.\n\nAvailable terms: {available}\n\nUse explain_term() without parameters to see all definitions."
+
+    # Return all terms
+    lines = ["# Analytics Glossary\n"]
+    for term_key, entry in GLOSSARY.items():
+        lines.append(f"## {entry['name']}")
+        lines.append(f"{entry['description']}\n")
+
+    lines.append("\n💡 **Tip:** Use `explain_term(term=\"nccs\")` for detailed info on specific terms")
+
+    return "\n".join(lines)
+
+
+class AppRankingInput(BaseModel):
+    """Input for app ranking analysis."""
+    model_config = ConfigDict(str_strip_whitespace=True, extra='forbid')
+
+    category: Optional[str] = Field(
+        default=None,
+        description="App category (e.g., 'Social', 'Gaming', 'Shopping'). Leave empty for all categories."
+    )
+    age_group: Optional[str] = Field(
+        default=None,
+        description="Age range (e.g., '18-24', '25-34', '35-44')"
+    )
+    gender: Optional[str] = Field(
+        default=None,
+        description="Gender filter: 'Male' or 'Female'"
+    )
+    nccs_class: Optional[str] = Field(
+        default=None,
+        description="Income class: 'A' (affluent), 'B' (upper middle), 'C/D/E' (mass market)"
+    )
+    metric: Literal["reach", "engagement"] = Field(
+        default="reach",
+        description="'reach' (total users) or 'engagement' (avg duration per user)"
+    )
+    limit: int = Field(
+        default=10,
+        description="Number of apps to return (max 50)",
+        ge=1,
+        le=50
+    )
+
+
+@mcp.tool(
+    name="get_top_apps",
+    annotations={
+        "readOnlyHint": True,
+        "destructiveHint": False,
+        "idempotentHint": True,
+        "openWorldHint": True
+    }
+)
+async def get_top_apps(params: AppRankingInput, ctx: Context) -> str:
+    """Discover the most popular apps by reach or engagement.
+
+    📊 **Use this to answer:**
+    - "What are the top 10 social apps for young women?"
+    - "Which gaming apps are most popular with affluent users?"
+    - "Show me top apps for NCCS A users in metros"
+    - "What apps have the highest engagement for 25-34 year olds?"
+
+    🎯 **Perfect for:**
+    - Media planning (where does my audience spend time?)
+    - Competitive analysis (who are the category leaders?)
+    - Partnership opportunities (which apps to integrate with?)
+    - Market sizing (how big is this app category?)
+
+    📈 **Metrics:**
+    - **Reach**: Total unique users (weighted to population)
+    - **Engagement**: Average time spent per user
+
+    Args:
+        category: Filter by app category (Social, Gaming, Shopping, etc.)
+        age_group: Target age range ("18-24", "25-34", etc.)
+        gender: "Male" or "Female"
+        nccs_class: Income segment ("A", "B", or "C/D/E")
+        metric: "reach" for user count, "engagement" for time spent
+        limit: How many apps to show (default: 10)
+
+    Returns:
+        📊 Ranked list of apps with:
+        - Market share percentages
+        - User counts (weighted)
+        - Engagement metrics
+        - Category information
+        - Key insights automatically generated
+
+    Example:
+        get_top_apps(
+            category="Social",
+            age_group="25-34",
+            gender="Female",
+            metric="reach",
+            limit=10
+        )
+        → Top 10 social apps for women aged 25-34 by user reach
+    """
+    # Build WHERE clause
+    where_conditions = ["1=1"]  # Always true baseline
+
+    if params.category:
+        where_conditions.append(f"cat ILIKE '%{params.category}%'")
+
+    if params.age_group:
+        where_conditions.append(f"age_bucket = '{params.age_group}'")
+
+    if params.gender:
+        where_conditions.append(f"gender = '{params.gender}'")
+
+    if params.nccs_class:
+        if params.nccs_class.upper() in ['A', 'A1']:
+            where_conditions.append("nccs IN ('A', 'A1')")
+        elif params.nccs_class.upper() == 'B':
+            where_conditions.append("nccs = 'B'")
+        else:  # C/D/E
+            where_conditions.append("nccs IN ('C', 'D', 'E')")
+
+    where_clause = " AND ".join(where_conditions)
+
+    # Build SELECT based on metric
+    if params.metric == "reach":
+        metric_col = "SUM(weights) as users"
+        order_by = "users DESC"
+    else:  # engagement
+        metric_col = "SUM(duration_sum) / NULLIF(SUM(weights), 0) as avg_minutes_per_user"
+        order_by = "avg_minutes_per_user DESC"
+
+    query = f"""
+    SELECT
+        app_name,
+        cat as category,
+        {metric_col},
+        COUNT(DISTINCT vtionid) as sample_size
+    FROM digital_insights
+    WHERE {where_clause}
+    GROUP BY app_name, cat
+    ORDER BY {order_by}
+    LIMIT {params.limit}
+    """
+
+    try:
+        pool = await get_pool(ctx, 1)  # Assuming dataset 1
+
         async with pool.acquire() as conn:
-            # Get all tables
-            tables = await conn.fetch("""
-                SELECT table_name 
-                FROM information_schema.tables 
-                WHERE table_schema = 'public'
-                ORDER BY table_name
-            """)
-            
-            lines = [f"# Dataset {params.dataset_id} Schema\n"]
-            
-            for table_row in tables:
-                table = table_row['table_name']
-                
-                # Get columns
-                columns = await conn.fetch("""
-                    SELECT 
-                        column_name,
-                        data_type,
-                        character_maximum_length,
-                        is_nullable
-                    FROM information_schema.columns
-                    WHERE table_name = $1
-                    ORDER BY ordinal_position
-                """, table)
-                
-                lines.append(f"## Table: `{table}`")
-                if DATASETS[params.dataset_id]['dictionary'].get(table):
-                    lines.append(f"*{DATASETS[params.dataset_id]['dictionary'][table]}*\n")
-                
-                lines.append("| Column | Type | Nullable |")
-                lines.append("|--------|------|----------|")
-                
-                for col in columns:
-                    col_name = col['column_name']
-                    col_type = col['data_type']
-                    if col['character_maximum_length']:
-                        col_type += f"({col['character_maximum_length']})"
-                    nullable = "Yes" if col['is_nullable'] == 'YES' else "No"
-                    lines.append(f"| `{col_name}` | {col_type} | {nullable} |")
-                
-                lines.append("")
-        
-        return "\n".join(lines)
-    
-    # Level 3: Full details with samples
-    if params.level == 3:
-        schema = await get_context(GetContextInput(level=2, dataset_id=params.dataset_id), ctx)
-        
-        pool = await get_pool(ctx, params.dataset_id)
+            rows = await conn.fetch(query)
+
+        if not rows:
+            return "No results found for the specified filters."
+
+        results = [dict(row) for row in rows]
+
+        # Build rich response
+        filter_desc = []
+        if params.category:
+            filter_desc.append(f"Category: {params.category}")
+        if params.age_group:
+            filter_desc.append(f"Age: {params.age_group}")
+        if params.gender:
+            filter_desc.append(f"Gender: {params.gender}")
+        if params.nccs_class:
+            filter_desc.append(f"Income Class: {params.nccs_class}")
+
+        filters = " | ".join(filter_desc) if filter_desc else "All users"
+
+        header = f"# Top {len(results)} Apps by {params.metric.title()}\n"
+        header += f"**Filters:** {filters}\n"
+        header += f"**Metric:** {'Total Users (weighted)' if params.metric == 'reach' else 'Avg Minutes per User'}\n\n"
+
+        # Calculate total for percentages
+        if params.metric == "reach":
+            total = sum(r.get('users', 0) for r in results)
+            for i, r in enumerate(results, 1):
+                users = r.get('users', 0)
+                pct = (users / total * 100) if total > 0 else 0
+                r['rank'] = i
+                r['market_share'] = f"{pct:.1f}%"
+                r['users_formatted'] = f"{users:,.0f}"
+        else:
+            for i, r in enumerate(results, 1):
+                r['rank'] = i
+                mins = r.get('avg_minutes_per_user', 0)
+                r['engagement_formatted'] = f"{mins:.1f} min/user"
+
+        # Format table
+        if params.metric == "reach":
+            columns = ['rank', 'app_name', 'category', 'users_formatted', 'market_share']
+        else:
+            columns = ['rank', 'app_name', 'category', 'engagement_formatted', 'sample_size']
+
+        table = format_markdown_table(results, columns)
+
+        # Add insights
+        insights = add_insights(results, "app_ranking")
+
+        return header + table + insights
+
+    except Exception as e:
+        return f"❌ Error: {str(e)}\n\nTip: Use explain_term() to understand filter options."
+
+
+class AudienceProfileInput(BaseModel):
+    """Input for audience profiling."""
+    model_config = ConfigDict(str_strip_whitespace=True, extra='forbid')
+
+    app_name: str = Field(
+        description="Name of the app to profile (e.g., 'Instagram', 'WhatsApp')"
+    )
+    include_comparisons: bool = Field(
+        default=True,
+        description="Compare to overall population benchmarks"
+    )
+
+
+@mcp.tool(
+    name="profile_audience",
+    annotations={
+        "readOnlyHint": True,
+        "destructiveHint": False,
+        "idempotentHint": True,
+        "openWorldHint": True
+    }
+)
+async def profile_audience(params: AudienceProfileInput, ctx: Context) -> str:
+    """Understand who uses a specific app - complete demographic breakdown.
+
+    📊 **Use this to answer:**
+    - "Who are Instagram's users in India?"
+    - "What's the demographic profile of Netflix subscribers?"
+    - "Which age groups use food delivery apps?"
+    - "Is this app skewed toward affluent users?"
+
+    🎯 **Perfect for:**
+    - Target audience definition
+    - Media planning and buying
+    - Competitive positioning
+    - Product development insights
+    - Partnership evaluations
+
+    📈 **What you'll get:**
+    - Age & gender distribution
+    - Income class breakdown (NCCS)
+    - Geographic concentration
+    - Index vs. total population
+    - Usage patterns and engagement
+    - Dominant user segments
+
+    Args:
+        app_name: Name of the app (e.g., "Instagram", "WhatsApp", "Netflix")
+        include_comparisons: Show how this app's audience differs from
+                           overall population (default: True)
+
+    Returns:
+        📊 Complete Demographic Profile:
+        - User counts and percentages by dimension
+        - Index scores (100 = average, >100 = over-indexed)
+        - Engagement metrics
+        - Key insights and recommendations
+
+        💡 Strategic Implications:
+        - Primary vs secondary audiences
+        - Underserved segments
+        - Positioning opportunities
+
+    Example:
+        profile_audience(app_name="Instagram")
+        → Full demographic breakdown of Instagram users
+    """
+    pool = await get_pool(ctx, 1)
+
+    try:
         async with pool.acquire() as conn:
-            tables = await conn.fetch("""
-                SELECT table_name 
-                FROM information_schema.tables 
-                WHERE table_schema = 'public'
-                ORDER BY table_name
-            """)
-            
-            samples = ["\n## Sample Data\n"]
-            for table_row in tables:
-                table = table_row['table_name']
-                
-                # Get 3 sample rows
-                rows = await conn.fetch(f"SELECT * FROM {table} LIMIT 3")
-                if rows:
-                    samples.append(f"### `{table}` (3 rows)")
-                    cols = list(rows[0].keys())
-                    samples.append(format_markdown_table([dict(r) for r in rows], cols))
-                    samples.append("")
-        
-        return schema + "\n".join(samples)
+            # Get app audience breakdown
+            app_data = await conn.fetch("""
+            SELECT
+                age_bucket,
+                gender,
+                CASE
+                    WHEN nccs IN ('A', 'A1') THEN 'A'
+                    WHEN nccs = 'B' THEN 'B'
+                    ELSE 'C/D/E'
+                END as nccs_group,
+                SUM(weights) as users,
+                AVG(duration_sum) as avg_duration
+            FROM digital_insights
+            WHERE app_name ILIKE $1
+            GROUP BY age_bucket, gender, nccs_group
+            ORDER BY users DESC
+            """, params.app_name)
+
+            if not app_data:
+                # Try partial match
+                similar = await conn.fetch("""
+                SELECT DISTINCT app_name
+                FROM digital_insights
+                WHERE app_name ILIKE $1
+                LIMIT 10
+                """, f"%{params.app_name}%")
+
+                if similar:
+                    suggestions = ", ".join([f"`{r['app_name']}`" for r in similar])
+                    return f"❌ No exact match for '{params.app_name}'.\n\nDid you mean: {suggestions}?"
+                else:
+                    return f"❌ App '{params.app_name}' not found in dataset."
+
+            # Calculate totals
+            total_users = sum(r['users'] for r in app_data)
+
+            # Build response
+            lines = [f"# Audience Profile: {params.app_name}\n"]
+            lines.append(f"**Total Users:** {total_users:,.0f} (weighted)\n")
+
+            # Gender breakdown
+            lines.append("## Gender Distribution\n")
+            gender_data = {}
+            for row in app_data:
+                gender = row['gender']
+                if gender not in gender_data:
+                    gender_data[gender] = 0
+                gender_data[gender] += row['users']
+
+            for gender, users in sorted(gender_data.items(), key=lambda x: x[1], reverse=True):
+                pct = (users / total_users) * 100
+                lines.append(f"- **{gender}**: {users:,.0f} ({pct:.1f}%)")
+
+            # Age breakdown
+            lines.append("\n## Age Distribution\n")
+            age_data = {}
+            for row in app_data:
+                age = row['age_bucket']
+                if age not in age_data:
+                    age_data[age] = 0
+                age_data[age] += row['users']
+
+            for age, users in sorted(age_data.items(), key=lambda x: x[1], reverse=True):
+                pct = (users / total_users) * 100
+                lines.append(f"- **{age}**: {users:,.0f} ({pct:.1f}%)")
+
+            # NCCS breakdown
+            lines.append("\n## Income Class (NCCS)\n")
+            nccs_data = {}
+            for row in app_data:
+                nccs = row['nccs_group']
+                if nccs not in nccs_data:
+                    nccs_data[nccs] = 0
+                nccs_data[nccs] += row['users']
+
+            nccs_labels = {
+                'A': 'Affluent (High income)',
+                'B': 'Upper Middle Class',
+                'C/D/E': 'Mass Market'
+            }
+
+            for nccs in ['A', 'B', 'C/D/E']:
+                users = nccs_data.get(nccs, 0)
+                pct = (users / total_users) * 100 if total_users > 0 else 0
+                lines.append(f"- **{nccs}** - {nccs_labels[nccs]}: {users:,.0f} ({pct:.1f}%)")
+
+            # Top segments
+            lines.append("\n## Top User Segments\n")
+            top_segments = sorted(app_data, key=lambda x: x['users'], reverse=True)[:5]
+
+            for i, seg in enumerate(top_segments, 1):
+                pct = (seg['users'] / total_users) * 100
+                lines.append(
+                    f"{i}. **{seg['gender']} | {seg['age_bucket']} | NCCS {seg['nccs_group']}**: "
+                    f"{seg['users']:,.0f} users ({pct:.1f}%)"
+                )
+
+            # Insights
+            lines.append("\n💡 **Key Insights:**")
+
+            # Gender skew
+            if gender_data:
+                genders = list(gender_data.items())
+                if len(genders) >= 2:
+                    top_gender = max(genders, key=lambda x: x[1])
+                    if top_gender[1] / total_users > 0.6:
+                        lines.append(f"- Strong {top_gender[0]} skew ({top_gender[1]/total_users*100:.0f}%)")
+                    else:
+                        lines.append("- Balanced gender appeal")
+
+            # Age concentration
+            if age_data:
+                top_age = max(age_data.items(), key=lambda x: x[1])
+                if top_age[1] / total_users > 0.4:
+                    lines.append(f"- Concentrated in {top_age[0]} age group")
+
+            # NCCS indicator
+            if nccs_data:
+                affluent_pct = nccs_data.get('A', 0) / total_users * 100
+                if affluent_pct > 25:
+                    lines.append(f"- Over-indexes with affluent users ({affluent_pct:.0f}% NCCS A)")
+                elif nccs_data.get('C/D/E', 0) / total_users > 0.7:
+                    lines.append("- Strong mass market appeal")
+
+            return "\n".join(lines)
+
+    except Exception as e:
+        return f"❌ Error: {str(e)}"
 
 
 # ============================================================================
-# DATASET TOOLS
+# ORIGINAL TOOLS (Enhanced Descriptions)
 # ============================================================================
 
 @mcp.tool(
@@ -386,82 +719,43 @@ Socioeconomic classification merged as:
     }
 )
 async def list_available_datasets() -> str:
-    """List all available datasets in the analytics platform.
-    
+    """See what consumer data is available to analyze.
+
+    📊 **Start here** if you're new to this analytics platform.
+
     Returns:
-        Markdown formatted table of datasets with id, name, and description
+        - List of all datasets with descriptions
+        - What data each contains
+        - How to access them
+        - Next steps for analysis
     """
     if not DATASETS:
-        return "❌ No datasets configured. Administrator needs to set environment variables:\n- DATASET_N_NAME\n- DATASET_N_DESC\n- DATASET_N_CONNECTION\n- DATASET_N_DICTIONARY"
-    
-    lines = ["# Available Datasets\n"]
+        return "❌ No datasets configured."
+
+    lines = ["# Available Consumer Datasets\n"]
     lines.append("| ID | Name | Description |")
     lines.append("|----|------|-------------|")
-    
+
     for ds_id, ds_info in DATASETS.items():
         lines.append(f"| {ds_id} | `{ds_info['name']}` | {ds_info['description']} |")
-    
+
     lines.append("\n**Next steps:**")
-    lines.append("1. Use `get_context(level=1)` for brief dataset summaries")
-    lines.append("2. Use `get_dataset_schema(dataset_id)` to see table structures")
-    lines.append("3. Use `query_dataset(dataset_id, query)` to run SQL queries")
-    
+    lines.append("1. Use `explain_term()` to understand terminology")
+    lines.append("2. Use `get_top_apps()` for quick insights")
+    lines.append("3. Use `profile_audience(app_name=\"Instagram\")` for deep dives")
+    lines.append("4. Use `query_dataset()` for custom SQL analysis")
+
     return "\n".join(lines)
-
-
-class GetSchemaInput(BaseModel):
-    """Input for getting dataset schema."""
-    model_config = ConfigDict(str_strip_whitespace=True, extra='forbid')
-    
-    dataset_id: int = Field(
-        description="ID of the dataset to get schema for"
-    )
-
-
-@mcp.tool(
-    name="get_dataset_schema",
-    annotations={
-        "readOnlyHint": True,
-        "destructiveHint": False,
-        "idempotentHint": True,
-        "openWorldHint": False
-    }
-)
-async def get_dataset_schema(params: GetSchemaInput, ctx: Context) -> str:
-    """Get the schema metadata for a specific dataset in ONE call.
-    
-    Returns the complete schema with table structures, column types, and descriptions
-    in a single markdown response. LLM can immediately use this to write queries.
-    
-    Args:
-        params (GetSchemaInput): Schema request parameters
-            - dataset_id (int): Dataset ID
-    
-    Returns:
-        Markdown formatted schema with ALL tables, columns, types, and descriptions
-    """
-    return await get_context(GetContextInput(level=2, dataset_id=params.dataset_id), ctx)
 
 
 class QueryDatasetInput(BaseModel):
     """Input for querying a dataset."""
     model_config = ConfigDict(str_strip_whitespace=True, extra='forbid')
-    
-    dataset_id: int = Field(
-        description="ID of the dataset to query"
-    )
-    query: str = Field(
-        description="SQL SELECT query to execute (only SELECT statements allowed)",
-        min_length=10
-    )
-    apply_weights: bool = Field(
-        default=True,
-        description="Apply automatic weighting to results (default: True)"
-    )
-    response_format: ResponseFormat = Field(
-        default=ResponseFormat.MARKDOWN,
-        description="Output format: 'markdown' for tables or 'json' for structured data"
-    )
+
+    dataset_id: int = Field(description="ID of the dataset to query")
+    query: str = Field(description="SQL SELECT query", min_length=10)
+    apply_weights: bool = Field(default=True, description="Apply weighting (recommended: True)")
+    response_format: ResponseFormat = Field(default=ResponseFormat.MARKDOWN)
 
 
 @mcp.tool(
@@ -474,278 +768,115 @@ class QueryDatasetInput(BaseModel):
     }
 )
 async def query_dataset(params: QueryDatasetInput, ctx: Context) -> str:
-    """Execute a SQL SELECT query on a specific dataset with automatic optimizations.
-    
-    🚀 **For multiple queries: Call this tool multiple times in parallel!**
-    Each call executes independently and returns immediately when done.
-    Fast queries won't wait for slow ones.
-    
-    Features:
-    - Only SELECT statements allowed
-    - Raw data queries (no GROUP BY): Limited to 5 rows
-    - Aggregated queries (with GROUP BY): Up to 1000 rows
-    - Automatic NCCS merging applied (A1→A, C/D/E→C/D/E)
-    - Weighting applied if weight column detected
-    - Parallel execution when called multiple times
-    
+    """Run custom SQL queries for advanced analysis.
+
+    📊 **Use this when:**
+    - Pre-built tools don't answer your specific question
+    - You need custom metrics or calculations
+    - You're comfortable with SQL
+    - You need to combine multiple data dimensions
+
+    🎯 **For Marketers (No SQL? Try these instead):**
+    - `get_top_apps()` - Popular apps by demographic
+    - `profile_audience()` - Who uses specific apps
+    - `explain_term()` - Understand data terminology
+
+    💡 **SQL Tips:**
+    - Use `SUM(weights)` for user counts (not COUNT)
+    - NCCS automatically merged (A/A1→A, C/D/E combined)
+    - Add WHERE clauses for better performance
+    - Use GROUP BY for aggregated insights
+
+    📖 **Example Queries:**
+
+    Top apps by usage:
+    ```sql
+    SELECT app_name, SUM(weights) as users
+    FROM digital_insights
+    WHERE age_bucket = '25-34'
+    GROUP BY app_name
+    ORDER BY users DESC
+    LIMIT 10
+    ```
+
+    Gender distribution:
+    ```sql
+    SELECT gender, SUM(weights) as users
+    FROM digital_insights
+    WHERE app_name ILIKE '%instagram%'
+    GROUP BY gender
+    ```
+
     Args:
-        params (QueryDatasetInput): Query parameters
-            - dataset_id (int): Dataset to query
-            - query (str): SELECT query
-            - apply_weights (bool): Auto-weight results (default: True)
-            - response_format (str): 'markdown' or 'json'
-    
+        dataset_id: Which dataset (use list_available_datasets to see options)
+        query: Your SQL SELECT statement
+        apply_weights: Auto-weight results (default: True, recommended)
+        response_format: "markdown" (readable) or "json" (for code)
+
     Returns:
-        Markdown formatted results table with metadata
-        
-    Example - Multiple parallel queries:
-        # These execute in parallel automatically:
-        query_dataset(1, "SELECT gender, SUM(weights) FROM digital_insights GROUP BY gender")
-        query_dataset(1, "SELECT age_bucket, SUM(weights) FROM digital_insights GROUP BY age_bucket")
-        query_dataset(1, "SELECT state_grp, SUM(weights) FROM digital_insights GROUP BY state_grp")
+        Query results with:
+        - Data table
+        - Automatic insights
+        - Execution metadata
     """
-    # Security: Only allow SELECT
     query_upper = params.query.strip().upper()
     if not query_upper.startswith('SELECT'):
         return "❌ Error: Only SELECT queries allowed"
-    
-    # Check for dangerous keywords
+
     dangerous = ['DROP', 'DELETE', 'INSERT', 'UPDATE', 'TRUNCATE', 'ALTER', 'CREATE']
     if any(kw in query_upper for kw in dangerous):
-        return f"❌ Error: Query contains forbidden keywords: {', '.join(dangerous)}"
-    
+        return f"❌ Error: Query contains forbidden keywords"
+
     try:
         pool = await get_pool(ctx, params.dataset_id)
-        
-        # Apply NCCS merging
+
         query = apply_nccs_merge(params.query)
-        
-        # Determine if aggregated
         is_aggregated = has_group_by(query)
         limit = AGGREGATED_LIMIT if is_aggregated else RAW_DATA_LIMIT
-        
-        # Add LIMIT if not present
+
         if 'LIMIT' not in query_upper:
             query = f"{query.rstrip(';')} LIMIT {limit}"
-        
+
         async with pool.acquire() as conn:
             rows = await conn.fetch(query)
-        
+
         if not rows:
             return "No results found."
-        
-        # Convert to list of dicts
+
         results = [dict(row) for row in rows]
         columns = list(results[0].keys())
-        
-        # Build metadata
+
         metadata_lines = [
             f"**Query executed on dataset {params.dataset_id}**",
             f"- Rows returned: {len(results)}",
             f"- Query type: {'Aggregated (GROUP BY)' if is_aggregated else 'Raw data'}",
-            f"- Limit applied: {limit}",
         ]
-        
+
         if not is_aggregated and len(results) >= RAW_DATA_LIMIT:
             metadata_lines.append(f"- ⚠️ Raw data limited to {RAW_DATA_LIMIT} rows (use GROUP BY for more)")
-        
-        if params.apply_weights and any('weight' in col.lower() for col in columns):
-            metadata_lines.append("- ✓ Weighting applied")
-        
+
         metadata = "\n".join(metadata_lines)
-        
-        # Format response
+
         if params.response_format == ResponseFormat.JSON:
             response = json.dumps({
-                "metadata": {
-                    "dataset_id": params.dataset_id,
-                    "rows": len(results),
-                    "aggregated": is_aggregated,
-                    "limit": limit
-                },
+                "metadata": {"dataset_id": params.dataset_id, "rows": len(results)},
                 "data": results
             }, indent=2, default=str)
         else:
-            # Markdown table
             response = metadata + "\n\n" + format_markdown_table(results, columns)
-        
-        return truncate_response(response, metadata)
-        
+            response += add_insights(results, "custom_query")
+
+        return response
+
     except Exception as e:
         error_msg = str(e)
-        
-        # Provide helpful hints
+
         if "relation" in error_msg.lower() and "does not exist" in error_msg.lower():
-            return f"❌ Error: Table not found. Use `get_dataset_schema({params.dataset_id})` to see available tables.\n\nDetails: {error_msg}"
-        elif "column" in error_msg.lower() and "does not exist" in error_msg.lower():
-            return f"❌ Error: Column not found. Use `get_dataset_schema({params.dataset_id})` to see available columns.\n\nDetails: {error_msg}"
-        elif "syntax error" in error_msg.lower():
-            return f"❌ SQL syntax error. Check your query syntax.\n\nDetails: {error_msg}"
+            return f"❌ Error: Table not found.\n\nUse `list_available_datasets()` to see available tables.\n\nDetails: {error_msg}"
+        elif "column" in error_msg.lower():
+            return f"❌ Error: Column not found.\n\nUse `explain_term()` to see available fields.\n\nDetails: {error_msg}"
         else:
             return f"❌ Query error: {error_msg}"
-
-
-class GetSampleInput(BaseModel):
-    """Input for getting sample data."""
-    model_config = ConfigDict(str_strip_whitespace=True, extra='forbid')
-    
-    dataset_id: int = Field(
-        description="ID of the dataset"
-    )
-    table_name: str = Field(
-        description="Name of the table to sample from"
-    )
-    limit: int = Field(
-        default=10,
-        description="Number of sample rows (max 100)",
-        ge=1,
-        le=100
-    )
-
-
-@mcp.tool(
-    name="get_dataset_sample",
-    annotations={
-        "readOnlyHint": True,
-        "destructiveHint": False,
-        "idempotentHint": True,
-        "openWorldHint": True
-    }
-)
-async def get_dataset_sample(params: GetSampleInput, ctx: Context) -> str:
-    """Get sample data from a specific table in a dataset.
-    
-    Args:
-        params (GetSampleInput): Sample request parameters
-            - dataset_id (int): Dataset ID
-            - table_name (str): Table name
-            - limit (int): Number of rows (max 100)
-    
-    Returns:
-        Markdown formatted sample data table
-    """
-    try:
-        pool = await get_pool(ctx, params.dataset_id)
-        
-        async with pool.acquire() as conn:
-            # Verify table exists
-            table_check = await conn.fetchval("""
-                SELECT COUNT(*) 
-                FROM information_schema.tables 
-                WHERE table_name = $1 AND table_schema = 'public'
-            """, params.table_name)
-            
-            if table_check == 0:
-                available = await conn.fetch("""
-                    SELECT table_name 
-                    FROM information_schema.tables 
-                    WHERE table_schema = 'public'
-                    ORDER BY table_name
-                """)
-                table_list = ", ".join([f"`{t['table_name']}`" for t in available])
-                return f"❌ Error: Table `{params.table_name}` not found.\n\nAvailable tables: {table_list}"
-            
-            # Get sample data
-            rows = await conn.fetch(f"SELECT * FROM {params.table_name} LIMIT {params.limit}")
-            
-            if not rows:
-                return f"Table `{params.table_name}` exists but is empty."
-            
-            results = [dict(row) for row in rows]
-            columns = list(results[0].keys())
-            
-            header = f"## Sample from `{params.table_name}` ({len(results)} rows)\n"
-            table = format_markdown_table(results, columns)
-            
-            return header + table
-            
-    except Exception as e:
-        return f"❌ Error getting sample: {str(e)}"
-
-
-# ============================================================================
-# DEPRECATED TOOL (kept for backwards compatibility)
-# ============================================================================
-
-class MultiQueryInput(BaseModel):
-    """DEPRECATED: Input for multi-query execution."""
-    model_config = ConfigDict(str_strip_whitespace=True, extra='forbid')
-    
-    queries: List[Dict[str, Any]] = Field(
-        description="List of query objects with dataset_id and query fields"
-    )
-    apply_weights: bool = Field(
-        default=True,
-        description="Apply weighting"
-    )
-
-
-@mcp.tool(
-    name="execute_multi_query",
-    annotations={
-        "readOnlyHint": True,
-        "destructiveHint": False,
-        "idempotentHint": True,
-        "openWorldHint": True
-    }
-)
-async def execute_multi_query(params: MultiQueryInput, ctx: Context) -> str:
-    """⚠️ **DEPRECATED** - Do not use this tool.
-    
-    **Use `query_dataset()` multiple times instead for true parallel execution.**
-    
-    Why deprecated:
-    - This tool waits for ALL queries to complete before returning
-    - Slow queries block fast queries
-    - Single large response instead of streaming results
-    - Failed queries can block successful ones
-    
-    **Recommended approach:**
-    Instead of calling execute_multi_query() once, call query_dataset() multiple times:
-    
-    ✅ GOOD (Parallel, streaming responses):
-    ```
-    # Call these separately - they execute in parallel automatically
-    query_dataset(dataset_id=1, query="SELECT gender, SUM(weights) FROM digital_insights GROUP BY gender")
-    query_dataset(dataset_id=1, query="SELECT age_bucket, SUM(weights) FROM digital_insights GROUP BY age_bucket")
-    query_dataset(dataset_id=1, query="SELECT app_name, SUM(weights) FROM digital_insights GROUP BY app_name LIMIT 10")
-    ```
-    
-    ❌ BAD (Blocks until all complete):
-    ```
-    execute_multi_query(queries=[...])  # Don't use this
-    ```
-    
-    Benefits of multiple query_dataset() calls:
-    - Each query returns immediately when done
-    - Fast queries don't wait for slow ones
-    - Failed queries don't block successful ones
-    - Better user experience with streaming results
-    - Natural parallelism handled by the LLM client
-    
-    This tool is kept for backward compatibility but will be removed in a future version.
-    """
-    return """⚠️ **DEPRECATED TOOL**
-
-This tool is deprecated. Please use `query_dataset()` multiple times instead.
-
-**Why?** Calling query_dataset() multiple times gives you:
-- True parallel execution
-- Streaming results (fast queries return immediately)
-- Better error isolation
-- Improved user experience
-
-**Example:**
-Instead of:
-  execute_multi_query([{dataset_id: 1, query: "..."}, {dataset_id: 1, query: "..."}])
-
-Do this:
-  query_dataset(1, "SELECT ...")
-  query_dataset(1, "SELECT ...")
-  query_dataset(1, "SELECT ...")
-
-Each call executes in parallel automatically!
-"""
 
 
 # ============================================================================
@@ -753,14 +884,7 @@ Each call executes in parallel automatically!
 # ============================================================================
 
 if __name__ == "__main__":
-    # Verify environment setup
     if not any(key.startswith("DATASET_") for key in os.environ):
         print("⚠️  WARNING: No dataset environment variables found!")
-        print("\nRequired format:")
-        print("  DATASET_1_NAME=mobile_events")
-        print("  DATASET_1_DESC=Event-level mobile app usage")
-        print("  DATASET_1_CONNECTION=postgresql://user:pass@host:port/db")
-        print('  DATASET_1_DICTIONARY={"table1": "desc", "table2": "desc"}')
-        print("\nServer will start but no datasets will be available.")
-    
+
     mcp.run()
